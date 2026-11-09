@@ -1,0 +1,49 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en-US">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "./js/libs/three.module.min.js"
+            }
+        }
+    </script>
+    <script src="js/libs/stats.min.js"></script>  
+    <script src='js/libs/dat.gui.min.js'></script>
+    <style>
+        body {
+            font-family: Monospace;
+            background-color: #000;
+            color: #fff;
+            margin: 0px;
+            overflow: hidden;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 50;
+            display:block;
+        }
+        #info a { color: #f00; font-weight: bold; text-decoration: underline; cursor: pointer }
+    </style>
+    <title>Three.js Trail Renderer</title>
+</head>
+<body>
+
+<div id="info">
+    <a href="http://threejs.org" target="_blank">three.js</a> - Trail Renderer by <a href="https://github.com/mkkellogg">mkkellogg</a>
+</div>
+
+<script type="module" src="js/Main.js"></script>
+
+<div id="renderingContainer" style="position: absolute; left:0px; top:0px"></div>
+
+<script>
+
+   
+</script>
+</body>
+</html>
