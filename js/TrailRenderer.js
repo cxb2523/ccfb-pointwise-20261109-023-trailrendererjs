@@ -30,6 +30,18 @@ export class TrailRenderer extends THREE.Object3D {
         this.lastAdvanceTime = 0;
         this.paused = false;
         this.pauseAdvanceUpdateTimeDiff = 0;
+        // Counts every Float32Array allocation for the geometry attribute buffers.
+        // Only _allocFloat32Array() touches this; advance() must never trigger it.
+        this.float32ArrayAllocCount = 0;
+    }
+
+    _allocFloat32Array (length) {
+        this.float32ArrayAllocCount ++;
+        return new Float32Array(length);
+    }
+
+    _wrapIndex (index) {
+        return index >= this.length ? index - this.length : index;
     }
 
     setAdvanceFrequency(advanceFrequency) {
@@ -100,11 +112,12 @@ export class TrailRenderer extends THREE.Object3D {
 
         const geometry = new THREE.BufferGeometry();
 
-        const nodeIDs = new Float32Array(this.vertexCount);
-        const nodeVertexIDs = new Float32Array(this.vertexCount * this.VerticesPerNode);
-        const positions = new Float32Array(this.vertexCount * TrailRenderer.PositionComponentCount);
-        const nodeCenters = new Float32Array(this.vertexCount * TrailRenderer.PositionComponentCount);
-        const uvs = new Float32Array(this.vertexCount * TrailRenderer.UVComponentCount);
+        const nodeIDs = this._allocFloat32Array(this.vertexCount);
+        const nodeVertexIDs = this._allocFloat32Array(this.vertexCount * this.VerticesPerNode);
+        const positions = this._allocFloat32Array(this.vertexCount * TrailRenderer.PositionComponentCount);
+        const nodeCenters = this._allocFloat32Array(this.vertexCount * TrailRenderer.PositionComponentCount);
+        const normals = this._allocFloat32Array(this.vertexCount * TrailRenderer.PositionComponentCount);
+        const uvs = this._allocFloat32Array(this.vertexCount * TrailRenderer.UVComponentCount);
         const indices = new Uint32Array(this.faceCount * TrailRenderer.IndicesPerFace);
 
         const nodeIDAttribute = new THREE.BufferAttribute(nodeIDs, 1);
@@ -122,6 +135,10 @@ export class TrailRenderer extends THREE.Object3D {
         const positionAttribute = new THREE.BufferAttribute(positions, TrailRenderer.PositionComponentCount);
         positionAttribute.dynamic = true;
         geometry.setAttribute('position', positionAttribute);
+
+        const normalAttribute = new THREE.BufferAttribute(normals, TrailRenderer.PositionComponentCount);
+        normalAttribute.dynamic = true;
+        geometry.setAttribute('normal', normalAttribute);
 
         const uvAttribute = new THREE.BufferAttribute(uvs, TrailRenderer.UVComponentCount);
         uvAttribute.dynamic = true;
@@ -223,20 +240,31 @@ export class TrailRenderer extends THREE.Object3D {
         this.advanceGeometry(null, transformMatrix);
     }
 
-    advanceGeometry = function() { 
+    advanceGeometry = function() {
 
         return function advanceGeometry(positionAndOrientation, transformMatrix) {
-            const nextIndex = this.currentEnd + 1 >= this.length ? 0 : this.currentEnd + 1; 
+            // nextIndex is the ring slot that the new head node will occupy. Once the ring
+            // is full this slot already holds the oldest surviving node's vertex data, so
+            // writing into it here is the "head pointer wraps and overwrites the tail" step.
+            const nextIndex = this._wrapIndex(this.currentEnd + 1);
+
             if(transformMatrix) {
                 this.updateNodePositionsFromTransformMatrix(nextIndex, transformMatrix);
             } else {
                 this.updateNodePositionsFromOrientationTangent(nextIndex, positionAndOrientation.position, positionAndOrientation.tangent);
             }
+            this.updateNodeUV(nextIndex, this.currentNodeID);
+            this.updateNodeNormal(nextIndex, transformMatrix);
 
             if (this.currentLength >= 1) {
                 this.connectNodes(this.currentEnd , nextIndex);
                 if(this.currentLength >= this.length) {
-                    const disconnectIndex  = this.currentEnd + 1  >= this.length ? 0 : this.currentEnd + 1;
+                    // Ring is saturated: the node now being overwritten (nextIndex) used to
+                    // have an outgoing connection to its old successor. That connection must
+                    // be torn down in the same frame its vertex data gets reused, otherwise
+                    // the index buffer would reference a vertex that just moved elsewhere
+                    // along the trail (an extra/garbage triangle for one frame).
+                    const disconnectIndex  = this._wrapIndex(this.currentEnd + 1);
                     this.disconnectNodes(disconnectIndex);
                 }
             }
@@ -245,10 +273,7 @@ export class TrailRenderer extends THREE.Object3D {
                 this.currentLength ++;
             }
 
-            this.currentEnd++;
-            if (this.currentEnd >= this.length) {
-                this.currentEnd = 0;
-            }
+            this.currentEnd = nextIndex;
 
             if (this.currentLength >= 1) {
                 if(this.currentLength < this.length) {
@@ -340,7 +365,94 @@ export class TrailRenderer extends THREE.Object3D {
         nodeCenters.updateRange.count = this.VerticesPerNode * TrailRenderer.PositionComponentCount; 
     }
 
-    updateNodePositionsFromOrientationTangent = function() { 
+    // Writes the UV of only the newly-written node (O(VerticesPerNode), never a full-array pass).
+    // "t" mirrors the shader's existing (nodeVertexID / verticesPerNode) formula.
+    // "s" is nodeID / maxLength: nodeID is a permanent, ever-increasing counter assigned once
+    // per node and never touched again, so s keeps climbing by a fixed step every advance()
+    // regardless of which physical ring slot the node lands in. That makes it monotonic and
+    // seam-free across any number of ring wraps, including the instant a slot is overwritten.
+    updateNodeUV (nodeIndex, nodeID) {
+        const uv = this.geometry.getAttribute('uv');
+        const s = nodeID / this.length;
+        for (let i = 0; i < this.VerticesPerNode; i ++) {
+            const baseIndex = (nodeIndex * this.VerticesPerNode + i) * TrailRenderer.UVComponentCount;
+            uv.array[ baseIndex ] = s;
+            uv.array[ baseIndex + 1 ] = i / this.VerticesPerNode;
+        }
+        uv.needsUpdate = true;
+        uv.updateRange.offset = nodeIndex * this.VerticesPerNode * TrailRenderer.UVComponentCount;
+        uv.updateRange.count = this.VerticesPerNode * TrailRenderer.UVComponentCount;
+    }
+
+    updateNodeNormal = function() {
+
+        const tempMatrix3 = new THREE.Matrix3();
+        const tempNormal = new THREE.Vector3();
+
+        function getMatrix3FromMatrix4(matrix3, matrix4) {
+            const e = matrix4.elements;
+            matrix3.set(e[0], e[1], e[2],
+                        e[4], e[5], e[6],
+                        e[8], e[9], e[10]);
+        }
+
+        return function updateNodeNormal(nodeIndex, transformMatrix) {
+            const normals = this.geometry.getAttribute('normal');
+            tempNormal.set(0, 0, 1);
+            if (transformMatrix) {
+                getMatrix3FromMatrix4(tempMatrix3, transformMatrix);
+                tempNormal.applyMatrix3(tempMatrix3);
+                tempNormal.normalize();
+            }
+            for (let i = 0; i < this.VerticesPerNode; i ++) {
+                const baseIndex = (nodeIndex * this.VerticesPerNode + i) * TrailRenderer.PositionComponentCount;
+                normals.array[ baseIndex ] = tempNormal.x;
+                normals.array[ baseIndex + 1 ] = tempNormal.y;
+                normals.array[ baseIndex + 2 ] = tempNormal.z;
+            }
+            normals.needsUpdate = true;
+            normals.updateRange.offset = nodeIndex * this.VerticesPerNode * TrailRenderer.PositionComponentCount;
+            normals.updateRange.count = this.VerticesPerNode * TrailRenderer.PositionComponentCount;
+        };
+
+    }();
+
+    // Pure read-only helper mirroring the vertex shader's head/tail blend factor
+    // (see Shader.VertexShaderCore). It reads the same minID/maxID uniforms that
+    // updateUniforms() already maintains in O(1), so there is no separate per-vertex
+    // color buffer to keep in sync - the GPU already interpolates headColor/tailColor
+    // from this fraction every frame for free. Exists so tests can assert the alpha
+    // gradient stays linear/continuous across the ring-wrap seam.
+    getVertexFraction (nodeIndex) {
+        const nodeID = this.nodeIDs[ nodeIndex ];
+        const minID = this.material.uniforms.minID.value;
+        const maxID = this.material.uniforms.maxID.value;
+        return (maxID - nodeID) / (maxID - minID);
+    }
+
+    // Benchmark methodology: call benchmarkAdvance(1000) on a freshly-initialized trail
+    // (same length/head-geometry/target-motion as the pre-rewrite baseline) and compare
+    // avgMs against the same loop run against js/TrailRenderer.baseline.js (an untouched
+    // copy of this file from before the ring-buffer rewrite). See
+    // js/TrailRenderer.benchmark.js for the side-by-side comparison script.
+    benchmarkAdvance (iterations = 1000) {
+        const targetObject = this.targetObject;
+        const startAllocCount = this.float32ArrayAllocCount;
+        const start = performance.now();
+        for (let i = 0; i < iterations; i ++) {
+            targetObject.position.set(Math.sin(i * 0.05) * 10, Math.cos(i * 0.05) * 10, i * 0.01);
+            targetObject.rotation.y = i * 0.01;
+            this.advance();
+        }
+        const totalMs = performance.now() - start;
+        const avgMs = totalMs / iterations;
+        const allocCount = this.float32ArrayAllocCount - startAllocCount;
+        const result = { iterations, totalMs, avgMs, allocCount };
+        console.log(`[TrailRenderer benchmark] ${iterations} advance() calls: total=${totalMs.toFixed(2)}ms avg=${avgMs.toFixed(4)}ms/frame Float32Array allocations=${allocCount}`);
+        return result;
+    }
+
+    updateNodePositionsFromOrientationTangent = function() {
 
         const tempQuaternion = new THREE.Quaternion();
         const tempOffset = new THREE.Vector3();

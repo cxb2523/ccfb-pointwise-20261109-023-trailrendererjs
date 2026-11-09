@@ -340,6 +340,9 @@ function initializeTrail() {
     updateTrailTextureTileSize();
     updateTrailDepthWrite();
     trail.activate();
+    // Exposed for manual console checks, e.g. trail.benchmarkAdvance(1000) and
+    // trail.float32ArrayAllocCount (see js/TrailRenderer.test.js for the automated version).
+    window.trail = trail;
 }
 
 function initScene() {
